@@ -250,7 +250,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - if: ${{ ! inputs.skip_nix_install }}
-        uses: nixbuild/nix-quick-install-action@master
+        uses: nixbuild/nix-quick-install-action@v29
         with:
           github_access_token: ${{secrets.github_access_token}}
           nix_on_tmpfs: ${{inputs.nix_on_tmpfs}}
@@ -296,7 +296,7 @@ jobs:
         with:
           lfs: ${{ inputs.lfs }}
       - if: ${{ ! inputs.skip_nix_install }}
-        uses: nixbuild/nix-quick-install-action@master
+        uses: nixbuild/nix-quick-install-action@v29
         with:
           github_access_token: ${{secrets.github_access_token}}
           nix_on_tmpfs: ${{inputs.nix_on_tmpfs}}
