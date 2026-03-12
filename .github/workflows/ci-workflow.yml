@@ -254,6 +254,7 @@ jobs:
             experimental-features = nix-command flakes
             ${{inputs.nix_conf}}
           nix_version: ${{inputs.nix_version}}
+      - uses: DeterminateSystems/magic-nix-cache-action@main
       - name: Pre-evaluation script
         run: ${{inputs.pre_evaluation_script}}
       - name: Find builds
