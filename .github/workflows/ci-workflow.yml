@@ -260,6 +260,12 @@ jobs:
             experimental-features = nix-command flakes
             ${{inputs.nix_conf}}
           nix_version: ${{inputs.nix_version}}
+      - name: Configure .netrc for GitHub token
+        run: |
+          if [ -n '${{secrets.github_access_token}}' ]; then
+            printf 'machine github.com\nlogin github-token\npassword %s\n' '${{secrets.github_access_token}}' >> "$HOME/.netrc"
+            chmod 600 "$HOME/.netrc"
+          fi
       - name: Pre-evaluation script
         run: ${{inputs.pre_evaluation_script}}
       - name: Find builds
@@ -318,6 +324,12 @@ jobs:
           oidc: ${{inputs.oidc}}
           settings: ${{inputs.settings}}
           tags: ${{inputs.tags}}
+      - name: Configure .netrc for GitHub token
+        run: |
+          if [ -n '${{secrets.github_access_token}}' ]; then
+            printf 'machine github.com\nlogin github-token\npassword %s\n' '${{secrets.github_access_token}}' >> "$HOME/.netrc"
+            chmod 600 "$HOME/.netrc"
+          fi
 
       - name: Pre-build script
         run: ${{inputs.pre_build_script}}
