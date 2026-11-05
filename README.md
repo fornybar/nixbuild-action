@@ -57,9 +57,11 @@ This workflow installs Nix, checks out your repository and evaluates a
 `flake.nix` file found in it. It then automatically builds the derivations
 found in `checks` or `packages` (or both). You can configure exactly which
 derivations that should be built; by default all derivations in `checks` are
-built. The individual derivations will be built by separate (concurrent) GitHub
-Jobs which will give you a very nice overview over successful and failed builds
-on GitHub's workflow result page. Care has been taken to run your builds in the
+built. The flake is evaluated once with
+[nix-eval-jobs](https://github.com/nix-community/nix-eval-jobs), and each
+derivation is built on nixbuild.net as soon as it has been evaluated, all
+within a single GitHub job, so all builds share that job's time limit. Each
+build gets its own log group and error annotation. Care has been taken to run your builds in the
 [most
 performant](https://blog.nixbuild.net/posts/2022-03-16-lightning-fast-ci-with-nixbuild-net.html)
 way possible.
@@ -129,9 +131,15 @@ All build logs are automatically stored as workflow artifacts so you can
 download them if needed. You can also see the build logs in the GitHub Actions
 console UI.
 
-Retries replace each build's source artifacts and the combined artifacts.
-Both copies remain until retention expires. For multiple invocations per run,
-set distinct `artifact_prefix` values and keep them unchanged across retries.
+Results and logs are uploaded as the `ci-build-results` and `ci-build-logs`
+artifacts. When calling the workflow more than once per run, set distinct
+`artifact_prefix` values.
+
+The workflow fetches a pinned nix-eval-jobs by store path from
+cache.nixos.org, which avoids downloading a second nixpkgs. To update it, pick
+a nixpkgs revision and replace the paths in the install step with the output of
+`nix eval --raw github:NixOS/nixpkgs/<rev>#legacyPackages.<system>.nix-eval-jobs.outPath`
+for `x86_64-linux`, `aarch64-linux` and `aarch64-darwin`.
 
 ### Using `nixbuild-action`
 

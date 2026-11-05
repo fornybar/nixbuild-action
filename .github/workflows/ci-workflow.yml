@@ -28,7 +28,7 @@ on:
 
     outputs:
       success:
-        value: ${{ jobs.summary.outputs.success }}
+        value: ${{ jobs.ci.outputs.success }}
         description: |
           Outputs the string 'true' if all builds succeeded, otherwise 'false'.
           You need to set `ignore_build_failures` to `true` in order to get the
@@ -36,7 +36,7 @@ on:
           you can use this output.
 
       results:
-        value: ${{ jobs.summary.outputs.results }}
+        value: ${{ jobs.ci.outputs.results }}
         description: |
           Contains a JSON object that maps each build to its result. Look at the
           file `examples/using-the-ci-workflow/expected-result.json` to see an
@@ -73,10 +73,12 @@ on:
         default: ''
         required: false
         description: |
-          Nix command line arguments passed on to `nix flake show` and
+          Nix command line arguments passed on to `nix-eval-jobs` and
           `nix build`. The string provided here will be split on every space
           and newline, and the resulting parts will be passed as individual
-          arguments.
+          arguments. Both commands must accept them: `--option`, `--impure`,
+          `--override-input` and `--accept-flake-config` work, `-L` and
+          `--refresh` do not.
 
       oidc:
         type: boolean
@@ -104,11 +106,11 @@ on:
         required: false
         default: false
         description: |
-          If true, any remaining builds will be cancelled when the first build
-          failure is found. If false, all builds will be attempted no matter how
-          many builds fail. Note, `ignore_build_failures` must be false for this
-          option have any effect. If `ignore_build_failures` is true, no builds
-          will be cancelled.
+          If true, no new builds are started after the first build failure.
+          Builds already running are allowed to finish. If false, all builds
+          will be attempted no matter how many builds fail. Note,
+          `ignore_build_failures` must be false for this option have any
+          effect.
 
       runs_on:
         type: string
@@ -176,9 +178,16 @@ on:
         required: false
         default: ''
         description: |
-          Bash script that should be executed before running each build. Note,
-          every build runs as a separate job so this script (and all builds)
-          will be executed in parallel.
+          Bash script that should be executed once before evaluation and
+          builds start.
+
+      max_parallel_builds:
+        type: number
+        default: 32
+        required: false
+        description: |
+          Maximum number of concurrent `nix build` processes. Builds start as
+          soon as their derivation has been evaluated.
 
       generate_build_summary:
         type: boolean
@@ -225,87 +234,33 @@ on:
 
       artifact_prefix:
         type: string
+        default: 'ci'
+        required: false
+        description: |
+          Prefix of the `<prefix>-build-results` and `<prefix>-build-logs`
+          artifacts. Set distinct prefixes when this workflow is called more
+          than once in the same workflow run.
+
+      nix_eval_jobs:
+        type: string
         default: ''
         required: false
         description: |
-          Namespace for source and combined build artifacts. The default
-          supports one invocation per workflow run. Set distinct prefixes
-          for multiple invocations within the same workflow run. Keep each
-          prefix unchanged across retries.
+          Installable providing `bin/nix-eval-jobs`, resolved with
+          `--inputs-from <flake>`, so `nixpkgs#nix-eval-jobs` uses the
+          flake's own `nixpkgs` input. nix-eval-jobs must support `--select`.
+          By default the workflow uses nix-eval-jobs 2.35.4 from nixpkgs
+          1d060086d60cb76a40cf37109f979d88a5bd6396, fetched by store path from
+          cache.nixos.org.
 
 jobs:
 
-  eval-flake:
-    name: "Evaluate flake"
+  ci:
+    name: "Evaluate and build"
     runs-on: ${{inputs.runs_on}}
     outputs:
-      builds: ${{ steps.find-builds.outputs.builds }}
-      artifact_namespace: ${{ steps.artifact-namespace.outputs.namespace }}
-    steps:
-      - id: artifact-namespace
-        env:
-          PREFIX: ${{ inputs.artifact_prefix }}
-        run: |
-          set -euo pipefail
-          namespace="$(printf '%s' "$PREFIX" | shasum -a 256 | cut -d ' ' -f 1)"
-          echo "namespace=ci-$namespace" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
-      - uses: actions/cache@v5
-        with:
-          path: ~/.cache/nix
-          key: nix-git-cache-${{ runner.os }}-${{ hashFiles('**/flake.lock') }}
-          restore-keys: |
-            nix-git-cache-${{ runner.os }}-
-      - if: ${{ ! inputs.skip_nix_install }}
-        uses: nixbuild/nix-quick-install-action@v34
-        with:
-          github_access_token: ${{secrets.github_access_token}}
-          nix_on_tmpfs: ${{inputs.nix_on_tmpfs}}
-          nix_conf: |
-            experimental-features = nix-command flakes
-            ${{inputs.nix_conf}}
-          nix_version: ${{inputs.nix_version}}
-      - name: Configure .netrc for GitHub token
-        env:
-          GITHUB_ACCESS_TOKEN: ${{ secrets.github_access_token }}
-        run: |
-          if [ -n "$GITHUB_ACCESS_TOKEN" ]; then
-            printf 'machine github.com\nlogin github-token\npassword %s\n' "$GITHUB_ACCESS_TOKEN" >> "$HOME/.netrc"
-            chmod 600 "$HOME/.netrc"
-          fi
-      - name: Pre-evaluation script
-        run: ${{inputs.pre_evaluation_script}}
-      - name: Find builds
-        id: find-builds
-        run: |
-          set -eo pipefail
-          flake_json="$(mktemp)"
-          nix_args=()
-
-          # For Nix >= 2.14 we need --all-systems
-          if [[ "${{inputs.nix_version}}" =~ 2\.1[456789].* ]]; then
-            nix_args+=("--all-systems")
-          elif [[ "${{inputs.nix_version}}" =~ 2\.2.* ]]; then
-            nix_args+=("--all-systems")
-          fi
-
-          if [ -n "${{inputs.nix_args}}" ]; then
-            IFS='\n'
-            while read l; do
-              readarray -d ' ' -O "${#nix_args[@]}" -t nix_args < <(echo -n "$l")
-            done < <(echo "${{inputs.nix_args}}")
-          fi
-          nix flake show "${{inputs.flake}}" "${nix_args[@]}" --json > "$flake_json"
-          jq < "$flake_json" -rc '{checks: (.checks // {}), packages: (.packages // {})}|to_entries|map(.key as $top_attr | .value|to_entries|map(.key as $sys | .value|to_entries|map(.key as $attr | {name: "", description: "", top_attr: $top_attr, system: $sys, attr: $attr} + .value)))|flatten|map(select(${{inputs.filter_builds}}))|map(. as $x | (${{inputs.label_builds}}) as $l | $x + {label: $l})|"builds=\(.)"' >> "$GITHUB_OUTPUT"
-
-  build:
-    name: ${{matrix.build.label}}
-    needs: eval-flake
-    runs-on: ${{inputs.runs_on}}
-    strategy:
-      fail-fast: ${{ inputs.fail_fast }}
-      matrix:
-        build: ${{fromJSON(needs.eval-flake.outputs.builds)}}
+      success: ${{ steps.build.outputs.success }}
+      results: ${{ steps.build.outputs.results }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -331,6 +286,7 @@ jobs:
           oidc: ${{inputs.oidc}}
           settings: ${{inputs.settings}}
           tags: ${{inputs.tags}}
+          generate_summary_for: ${{ inputs.generate_build_summary && 'workflow' || '' }}
       - name: Configure .netrc for GitHub token
         env:
           GITHUB_ACCESS_TOKEN: ${{ secrets.github_access_token }}
@@ -339,140 +295,203 @@ jobs:
             printf 'machine github.com\nlogin github-token\npassword %s\n' "$GITHUB_ACCESS_TOKEN" >> "$HOME/.netrc"
             chmod 600 "$HOME/.netrc"
           fi
-
-      - name: Pre-build script
-        run: ${{inputs.pre_build_script}}
-
-      - id: artifact-name
+      - name: Pre-evaluation script
+        run: ${{inputs.pre_evaluation_script}}
+      - name: Install nix-eval-jobs
         env:
-          BUILD: ${{ toJSON(matrix.build) }}
-          NAMESPACE: ${{ needs.eval-flake.outputs.artifact_namespace }}
+          FLAKE: ${{ inputs.flake }}
+          INSTALLABLE: ${{ inputs.nix_eval_jobs }}
         run: |
           set -euo pipefail
-          key="$(jq -cj '[.top_attr, .system, .attr]' <<< "$BUILD" | shasum -a 256 | cut -d ' ' -f 1)"
-          echo "ARTIFACT_KEY=$key" >> "$GITHUB_ENV"
-          echo "ARTIFACT_PREFIX=$NAMESPACE-$key" >> "$GITHUB_ENV"
+          if [ -z "$INSTALLABLE" ]; then
+            case "$RUNNER_OS-$RUNNER_ARCH" in
+              Linux-X64) INSTALLABLE=/nix/store/sridvbqmfgyh1f2gk3pwf9n4zs98bqjw-nix-eval-jobs-2.35.4 ;;
+              Linux-ARM64) INSTALLABLE=/nix/store/agpwd1b8kpg757idbixf1c5vjjnm7nib-nix-eval-jobs-2.35.4 ;;
+              macOS-ARM64) INSTALLABLE=/nix/store/9bwlwb6w731vnvn6x3hpa3qnvxcibkz0-nix-eval-jobs-2.35.4 ;;
+              *) INSTALLABLE=github:NixOS/nixpkgs/1d060086d60cb76a40cf37109f979d88a5bd6396#nix-eval-jobs ;;
+            esac
+          fi
 
-      - name: "Build ${{matrix.build.top_attr}}.${{matrix.build.system}}.${{matrix.build.attr}}"
+          nix_eval_jobs="$(nix build --no-link --print-out-paths --inputs-from "$FLAKE" "$INSTALLABLE")/bin/nix-eval-jobs"
+          if ! grep -q -- --select <<< "$("$nix_eval_jobs" --help)"; then
+            echo "::error::$INSTALLABLE does not support --select; set nix_eval_jobs to a newer nix-eval-jobs"
+            exit 1
+          fi
+          echo "NIX_EVAL_JOBS=$nix_eval_jobs" >> "$GITHUB_ENV"
+      - name: Pre-build script
+        run: ${{inputs.pre_build_script}}
+      - name: Evaluate and build
         id: build
+        env:
+          FLAKE: ${{ inputs.flake }}
+          NIX_ARGS: ${{ inputs.nix_args }}
+          FILTER: ${{ inputs.filter_builds }}
+          LABEL: ${{ inputs.label_builds }}
+          IGNORE_FAILURES: ${{ inputs.ignore_build_failures }}
+          FAIL_FAST: ${{ inputs.fail_fast }}
+          MAX_PARALLEL: ${{ inputs.max_parallel_builds }}
         run: |
-          RESULTS="build.json"
-          LOGS="$ARTIFACT_PREFIX.log"
+          set -euo pipefail
+          shopt -s nullglob
+
+          if [ "$MAX_PARALLEL" -lt 1 ]; then
+            echo "::error::max_parallel_builds must be at least 1"
+            exit 1
+          fi
+
+          work="$RUNNER_TEMP/nixbuild-ci"
+          rm -rf "$work"
+          mkdir -p "$work/results" "$work/logs"
 
           nix_args=()
-          if [ -n "${{inputs.nix_args}}" ]; then
-            IFS='\n'
-            while read l; do
-              readarray -d ' ' -O "${#nix_args[@]}" -t nix_args < <(echo -n "$l")
-            done < <(echo "${{inputs.nix_args}}")
+          read -r -d '' -a nix_args <<< "$NIX_ARGS" || true
+
+          workers="$(getconf _NPROCESSORS_ONLN)"
+          eval_args=(--workers "$workers")
+          if [ -r /proc/meminfo ]; then
+            mem_mib="$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)"
+            eval_args+=(--max-memory-size "$(( mem_mib * 3 / 4 / workers ))")
           fi
 
-          touch "$RESULTS"
-          nix build "${{inputs.flake}}#${{matrix.build.top_attr}}.${{matrix.build.system}}.${{matrix.build.attr}}" \
-            --print-build-logs \
-            --eval-store auto \
-            --store ssh-ng://nixbuild \
-            --builders "" --max-jobs 2 \
-            --json "${nix_args[@]}" > "$RESULTS" \
-            2> >(tee -a "$LOGS" >&2) || true
+          evaluate() {
+            "$NIX_EVAL_JOBS" "${eval_args[@]}" "${nix_args[@]}" \
+              --flake "$FLAKE" \
+              --select '
+                flake:
+                let
+                  recurse = attrs: attrs // { recurseForDerivations = true; };
+                  systems = outputs: recurse (builtins.mapAttrs (_: recurse) outputs);
+                in
+                recurse {
+                  checks = systems (flake.outputs.checks or { });
+                  packages = systems (flake.outputs.packages or { });
+                }
+              ' \
+              --apply 'drv: { description = (builtins.tryEval (drv.meta.description or "")).value; }' |
+            jq -c --unbuffered '
+              {
+                top_attr: .attrPath[0],
+                system: (.attrPath[1] // ""),
+                attr: (.attrPath[2:] | join(".")),
+                name: (.name // ""),
+                description: (.extraValue.description // ""),
+                drvPath,
+                outputs,
+                error
+              }
+              | select(
+                '"$FILTER"'
+              )
+              | . + {label: (
+                '"$LABEL"'
+              )}
+            '
+          }
 
-          status=0
-          if ! [ -s "$RESULTS" ]; then
-            echo '[{"success":false}]' > "$RESULTS"
-            if [ "${{ inputs.ignore_build_failures }}" == "true" ]; then
-              echo "::error title=${{matrix.build.top_attr}}.${{matrix.build.system}}.${{matrix.build.attr}}::Build failed"
-            else
-              status=1
+          print_log() {
+            until mkdir "$work/lock" 2> /dev/null; do sleep 0.1; done
+            echo "::group::$1"
+            cat "$2"
+            echo "::endgroup::"
+            rmdir "$work/lock"
+          }
+
+          build() {
+            local n="$1" job="$2" label log ok=true
+            label="$(jq -r .label <<< "$job")"
+            log="$work/logs/$n-$(jq -j '"\(.top_attr).\(.system).\(.attr)"' <<< "$job" | tr -c 'A-Za-z0-9._+-' '_').log"
+
+            if jq -e .error <<< "$job" > /dev/null; then
+              jq -r .error <<< "$job" > "$log"
+              ok=false
+            elif ! nix build "$(jq -r .drvPath <<< "$job")^*" \
+                --no-link \
+                --print-build-logs \
+                --eval-store auto \
+                --store ssh-ng://nixbuild \
+                --builders "" --max-jobs 2 \
+                "${nix_args[@]}" 2> "$log"; then
+              ok=false
             fi
+
+            jq -c --argjson ok "$ok" '
+              {(.top_attr): {(.system): {(.attr):
+                ({success: $ok, name, description, label}
+                 + if $ok then {drvPath, outputs} else {} end)}}}
+            ' <<< "$job" > "$work/results/$n.json"
+
+            if "$ok"; then
+              print_log "✅ $label" "$log"
+            else
+              print_log "❌ $label" "$log"
+              echo "::error::Build failed: $label"
+              return 1
+            fi
+          }
+
+          stop_on_failure=false
+          if [ "$FAIL_FAST" = true ] && [ "$IGNORE_FAILURES" != true ]; then
+            stop_on_failure=true
           fi
 
-          jq -c '{success: true, name: "${{matrix.build.name}}", description: "${{matrix.build.description}}", label: "${{matrix.build.label}}"} + .[0] | {"${{matrix.build.top_attr}}": {"${{matrix.build.system}}": {"${{matrix.build.attr}}": .}}}' "$RESULTS" > "$ARTIFACT_PREFIX.json"
+          exec {evaluation}< <(evaluate)
+          evaluation_pid=$!
 
-          exit "$status"
+          n=0
+          stopped=false
+          while IFS= read -r -u "$evaluation" job; do
+            if "$stop_on_failure" && [ -e "$work/failed" ]; then
+              stopped=true
+              break
+            fi
+            while [ "$(jobs -rp | wc -l)" -ge "$MAX_PARALLEL" ]; do
+              wait -n || true
+            done
+            n=$((n + 1))
+            { build "$n" "$job" || touch "$work/failed"; } &
+          done
+          exec {evaluation}<&-
 
-      - name: Upload result
+          evaluation_ok=true
+          wait "$evaluation_pid" || evaluation_ok=false
+          wait
+
+          hard_failure=false
+          if ! "$evaluation_ok" && ! "$stopped"; then
+            echo "::error::Flake evaluation failed"
+            hard_failure=true
+          elif [ "$n" -eq 0 ]; then
+            echo "::error::No builds matched filter_builds"
+            hard_failure=true
+          fi
+
+          success=true
+          if "$hard_failure" || [ -e "$work/failed" ]; then
+            success=false
+          fi
+
+          results="$(cat "$work"/results/*.json /dev/null | jq -cn 'reduce inputs as $r ({}; . * $r)')"
+          echo "results=$results" >> "$GITHUB_OUTPUT"
+          echo "success=$success" >> "$GITHUB_OUTPUT"
+
+          if "$hard_failure" || { [ "$success" = false ] && [ "$IGNORE_FAILURES" != true ]; }; then
+            exit 1
+          fi
+
+      - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: |
-            ${{ needs.eval-flake.outputs.artifact_namespace }}-result-${{ env.ARTIFACT_KEY }}
-          path: |
-            ${{ env.ARTIFACT_PREFIX }}.json
+          name: ${{ inputs.artifact_prefix }}-build-results
+          path: ${{ runner.temp }}/nixbuild-ci/results/*.json
           overwrite: true
-          if-no-files-found: error
+          if-no-files-found: warn
 
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: |
-            ${{ needs.eval-flake.outputs.artifact_namespace }}-log-${{ env.ARTIFACT_KEY }}
-          path: |
-            ${{ env.ARTIFACT_PREFIX }}.log
+          name: ${{ inputs.artifact_prefix }}-build-logs
+          path: ${{ runner.temp }}/nixbuild-ci/logs/*.log
           overwrite: true
-          if-no-files-found: error
-
-
-  summary:
-    name: "Summary"
-    needs: [eval-flake, build]
-    runs-on: ${{inputs.runs_on}}
-    outputs:
-      success: ${{ steps.merge.outputs.success }}
-      results: ${{ steps.merge.outputs.results }}
-    steps:
-      - id: download
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ${{ needs.eval-flake.outputs.artifact_namespace }}-result-*
-          path: ${{ runner.temp }}/build-results
-          merge-multiple: true
-      - id: merge
-        env:
-          EXPECTED_BUILDS: ${{ needs.eval-flake.outputs.builds }}
-          RESULTS_PATH: ${{ steps.download.outputs.download-path }}
-        run: |
-          set -euo pipefail
-          merged="$(jq -ces --argjson expected "$EXPECTED_BUILDS" '
-            def identity: [.top_attr, .system, .attr];
-            . as $documents |
-            [ .[] | to_entries[] | .key as $top |
-              .value | to_entries[] | .key as $system |
-              .value | to_entries[] |
-              {top_attr: $top, system: $system, attr: .key, result: .value}
-            ] as $actual |
-            if ($actual | map(identity) | sort) != ($expected | map(identity) | sort) then
-              error("Build results do not match the expected builds")
-            elif any($actual[]; (.result.success | type) != "boolean") then
-              error("Build results must contain a boolean success value")
-            else
-              {results: (reduce $documents[] as $document ({}; . * $document)),
-               success: all($actual[]; .result.success)}
-            end
-          ' "$RESULTS_PATH"/*.json)"
-          jq -r '"results=\(.results | tojson)", "success=\(.success)"' <<< "$merged" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ inputs.artifact_prefix || needs.eval-flake.outputs.artifact_namespace }}-build-results
-          path: ${{ steps.download.outputs.download-path }}/*.json
-          overwrite: true
-          if-no-files-found: error
-      - id: download-logs
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ${{ needs.eval-flake.outputs.artifact_namespace }}-log-*
-          path: ${{ runner.temp }}/build-logs
-          merge-multiple: true
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ inputs.artifact_prefix || needs.eval-flake.outputs.artifact_namespace }}-build-logs
-          path: ${{ steps.download-logs.outputs.download-path }}/*.log
-          overwrite: true
-          if-no-files-found: error
-      - name: Generate nixbuild.net summary
-        if: ${{ always() && inputs.generate_build_summary }}
-        uses: nixbuild/nixbuild-action@master
-        with:
-          nixbuild_token: ${{secrets.nixbuild_token}}
-          oidc: ${{inputs.oidc}}
-          generate_summary_for: 'workflow'
+          if-no-files-found: warn
