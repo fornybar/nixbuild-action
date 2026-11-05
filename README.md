@@ -59,8 +59,9 @@ found in `checks` or `packages` (or both). You can configure exactly which
 derivations that should be built; by default all derivations in `checks` are
 built. Attribute names are listed first, and only the selected derivations
 are evaluated, once, with
-[nix-eval-jobs](https://github.com/nix-community/nix-eval-jobs). Each
-derivation is built on nixbuild.net as soon as it has been evaluated, all
+[nix-eval-jobs](https://github.com/nix-community/nix-eval-jobs), and each
+derivation whose outputs are not already built is built on nixbuild.net as
+soon as it has been evaluated, all
 within a single GitHub job, so all builds share that job's time limit. Each
 build gets its own log group and error annotation. Care has been taken to run
 your builds in the

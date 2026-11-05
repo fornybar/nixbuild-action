@@ -137,7 +137,9 @@ on:
           .name     : The build's derivation name
 
           Only derivations matching the filter are evaluated, unless the filter
-          uses `.name`.
+          uses `.name`. Outputs that already exist locally or in a substituter,
+          such as nixbuild.net, are reported as successful without running
+          `nix build`.
 
       label_builds:
         type: string
@@ -426,6 +428,7 @@ jobs:
           evaluate() {
             "$NIX_EVAL_JOBS" "${eval_args[@]}" "${nix_args[@]}" \
               --flake "$FLAKE" \
+              --check-cache-status \
               --select '
                 flake:
                 let
@@ -455,6 +458,7 @@ jobs:
                 description: (.extraValue.description // ""),
                 drvPath,
                 outputs,
+                cached: (.cacheStatus == "local" or .cacheStatus == "cached"),
                 derivation: (.extraValue.derivation != false),
                 error
               }
@@ -493,6 +497,9 @@ jobs:
             if jq -e .error <<< "$job" > /dev/null; then
               jq -r .error <<< "$job" > "$log"
               ok=false
+            elif jq -e .cached <<< "$job" > /dev/null; then
+              echo "Outputs are already built" > "$log"
+              label="$label (cached)"
             elif ! nix build "$(jq -r .drvPath <<< "$job")^*" \
                 --no-link \
                 --print-build-logs \
