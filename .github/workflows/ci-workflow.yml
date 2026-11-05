@@ -228,13 +228,10 @@ on:
         default: ''
         required: false
         description: |
-          The CI workflow stores two build artifacts, one for build logs and
-          one for JSON representations of the build results. To be able to
-          reuse the CI workflow multiple times inside the same workflow, a
-          unique artifact prefix is generated. If you want to set the prefix
-          yourself you can do it with this setting. Remember that you can't
-          use the same prefix for multiple invocations of the CI workflow
-          within the same workflow.
+          Namespace for source and combined build artifacts. The default
+          supports one invocation per workflow run. Set distinct prefixes
+          for multiple invocations within the same workflow run. Keep each
+          prefix unchanged across retries.
 
 jobs:
 
@@ -243,7 +240,15 @@ jobs:
     runs-on: ${{inputs.runs_on}}
     outputs:
       builds: ${{ steps.find-builds.outputs.builds }}
+      artifact_namespace: ${{ steps.artifact-namespace.outputs.namespace }}
     steps:
+      - id: artifact-namespace
+        env:
+          PREFIX: ${{ inputs.artifact_prefix }}
+        run: |
+          set -euo pipefail
+          namespace="$(printf '%s' "$PREFIX" | shasum -a 256 | cut -d ' ' -f 1)"
+          echo "namespace=ci-$namespace" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
       - uses: actions/cache@v5
         with:
@@ -334,12 +339,19 @@ jobs:
       - name: Pre-build script
         run: ${{inputs.pre_build_script}}
 
+      - id: artifact-name
+        env:
+          BUILD: ${{ toJSON(matrix.build) }}
+          NAMESPACE: ${{ needs.eval-flake.outputs.artifact_namespace }}
+        run: |
+          set -euo pipefail
+          key="$(jq -cj '[.top_attr, .system, .attr]' <<< "$BUILD" | shasum -a 256 | cut -d ' ' -f 1)"
+          echo "ARTIFACT_KEY=$key" >> "$GITHUB_ENV"
+          echo "ARTIFACT_PREFIX=$NAMESPACE-$key" >> "$GITHUB_ENV"
+
       - name: "Build ${{matrix.build.top_attr}}.${{matrix.build.system}}.${{matrix.build.attr}}"
         id: build
         run: |
-          ARTIFACT_PREFIX="$(echo "${{matrix.build.top_attr}}.${{matrix.build.system}}.${{matrix.build.attr}}" | tr '":<>|*?\\/' '_')-$RANDOM$RANDOM"
-          echo "ARTIFACT_PREFIX=$ARTIFACT_PREFIX" >> "$GITHUB_ENV"
-
           RESULTS="build.json"
           LOGS="$ARTIFACT_PREFIX.log"
 
@@ -379,63 +391,80 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: |
-            build-result-${{ env.ARTIFACT_PREFIX }}
+            ${{ needs.eval-flake.outputs.artifact_namespace }}-result-${{ env.ARTIFACT_KEY }}
           path: |
             ${{ env.ARTIFACT_PREFIX }}.json
+          overwrite: true
+          if-no-files-found: error
 
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: |
-            build-log-${{ env.ARTIFACT_PREFIX }}
+            ${{ needs.eval-flake.outputs.artifact_namespace }}-log-${{ env.ARTIFACT_KEY }}
           path: |
             ${{ env.ARTIFACT_PREFIX }}.log
+          overwrite: true
+          if-no-files-found: error
 
 
   summary:
     name: "Summary"
-    needs: build
+    needs: [eval-flake, build]
     runs-on: ${{inputs.runs_on}}
     outputs:
       success: ${{ steps.merge.outputs.success }}
       results: ${{ steps.merge.outputs.results }}
     steps:
-      - id: generate-artifact-prefix
-        run: |
-          if [ -z "${{ inputs.artifact_prefix }}" ]; then
-            ARTIFACT_PREFIX="$RANDOM$RANDOM"
-          else
-            ARTIFACT_PREFIX="${{ inputs.artifact_prefix }}"
-          fi
-          echo "ARTIFACT_PREFIX=$ARTIFACT_PREFIX" >> "$GITHUB_ENV"
-      - id: merge-results
-        uses: actions/upload-artifact/merge@v4
-        with:
-          name: ${{ env.ARTIFACT_PREFIX }}-build-results
-          pattern: build-result-*
-          delete-merged: true
-      - id: merge-logs
-        uses: actions/upload-artifact/merge@v4
-        with:
-          name: ${{ env.ARTIFACT_PREFIX }}-build-logs
-          pattern: build-log-*
-          delete-merged: true
       - id: download
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.ARTIFACT_PREFIX }}-build-results
-          path: ~/results
+          pattern: ${{ needs.eval-flake.outputs.artifact_namespace }}-result-*
+          path: ${{ runner.temp }}/build-results
+          merge-multiple: true
       - id: merge
+        env:
+          EXPECTED_BUILDS: ${{ needs.eval-flake.outputs.builds }}
+          RESULTS_PATH: ${{ steps.download.outputs.download-path }}
         run: |
-          jq -rcs 'reduce .[] as $x ({}; . * $x)|"results=\(.)"' \
-            "${{steps.download.outputs.download-path}}"/*.json \
-            >> "$GITHUB_OUTPUT"
-          if jq -s '..|.success?|select(if . == false then ""|halt_error(1) else false end)' "${{steps.download.outputs.download-path}}"/*.json; then
-            echo "success=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "success=false" >> "$GITHUB_OUTPUT"
-          fi
+          set -euo pipefail
+          merged="$(jq -ces --argjson expected "$EXPECTED_BUILDS" '
+            def identity: [.top_attr, .system, .attr];
+            . as $documents |
+            [ .[] | to_entries[] | .key as $top |
+              .value | to_entries[] | .key as $system |
+              .value | to_entries[] |
+              {top_attr: $top, system: $system, attr: .key, result: .value}
+            ] as $actual |
+            if ($actual | map(identity) | sort) != ($expected | map(identity) | sort) then
+              error("Build results do not match the expected builds")
+            elif any($actual[]; (.result.success | type) != "boolean") then
+              error("Build results must contain a boolean success value")
+            else
+              {results: (reduce $documents[] as $document ({}; . * $document)),
+               success: all($actual[]; .result.success)}
+            end
+          ' "$RESULTS_PATH"/*.json)"
+          jq -r '"results=\(.results | tojson)", "success=\(.success)"' <<< "$merged" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix || needs.eval-flake.outputs.artifact_namespace }}-build-results
+          path: ${{ steps.download.outputs.download-path }}/*.json
+          overwrite: true
+          if-no-files-found: error
+      - id: download-logs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ needs.eval-flake.outputs.artifact_namespace }}-log-*
+          path: ${{ runner.temp }}/build-logs
+          merge-multiple: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix || needs.eval-flake.outputs.artifact_namespace }}-build-logs
+          path: ${{ steps.download-logs.outputs.download-path }}/*.log
+          overwrite: true
+          if-no-files-found: error
       - name: Generate nixbuild.net summary
         if: ${{ always() && inputs.generate_build_summary }}
         uses: nixbuild/nixbuild-action@master

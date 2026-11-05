@@ -129,6 +129,10 @@ All build logs are automatically stored as workflow artifacts so you can
 download them if needed. You can also see the build logs in the GitHub Actions
 console UI.
 
+Retries replace each build's source artifacts and the combined artifacts.
+Both copies remain until retention expires. For multiple invocations per run,
+set distinct `artifact_prefix` values and keep them unchanged across retries.
+
 ### Using `nixbuild-action`
 
 1. Install Nix with either
