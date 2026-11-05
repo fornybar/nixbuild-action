@@ -57,11 +57,13 @@ This workflow installs Nix, checks out your repository and evaluates a
 `flake.nix` file found in it. It then automatically builds the derivations
 found in `checks` or `packages` (or both). You can configure exactly which
 derivations that should be built; by default all derivations in `checks` are
-built. The flake is evaluated once with
-[nix-eval-jobs](https://github.com/nix-community/nix-eval-jobs), and each
+built. Attribute names are listed first, and only the selected derivations
+are evaluated, once, with
+[nix-eval-jobs](https://github.com/nix-community/nix-eval-jobs). Each
 derivation is built on nixbuild.net as soon as it has been evaluated, all
 within a single GitHub job, so all builds share that job's time limit. Each
-build gets its own log group and error annotation. Care has been taken to run your builds in the
+build gets its own log group and error annotation. Care has been taken to run
+your builds in the
 [most
 performant](https://blog.nixbuild.net/posts/2022-03-16-lightning-fast-ci-with-nixbuild-net.html)
 way possible.

@@ -136,6 +136,9 @@ on:
           .attr     : The build's attribute name, as defined in your flake
           .name     : The build's derivation name
 
+          Only derivations matching the filter are evaluated, unless the filter
+          uses `.name`.
+
       label_builds:
         type: string
         required: false
@@ -259,7 +262,7 @@ jobs:
     name: "Evaluate and build"
     runs-on: ${{inputs.runs_on}}
     outputs:
-      success: ${{ steps.build.outputs.success }}
+      success: ${{ steps.build.outputs.success || steps.select.outputs.success }}
       results: ${{ steps.build.outputs.results }}
     steps:
       - uses: actions/checkout@v4
@@ -320,6 +323,79 @@ jobs:
           echo "NIX_EVAL_JOBS=$nix_eval_jobs" >> "$GITHUB_ENV"
       - name: Pre-build script
         run: ${{inputs.pre_build_script}}
+      - name: Prepare build directories
+        env:
+          MAX_PARALLEL: ${{ inputs.max_parallel_builds }}
+        run: |
+          set -euo pipefail
+          if [ "$MAX_PARALLEL" -lt 1 ]; then
+            echo "::error::max_parallel_builds must be at least 1"
+            exit 1
+          fi
+
+          work="$RUNNER_TEMP/nixbuild-ci"
+          rm -rf "$work"
+          mkdir -p "$work/results" "$work/logs"
+
+      - name: Select builds
+        id: select
+        env:
+          FLAKE: ${{ inputs.flake }}
+          NIX_ARGS: ${{ inputs.nix_args }}
+          FILTER: ${{ inputs.filter_builds }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/nixbuild-ci"
+
+          nix_args=()
+          read -r -d '' -a nix_args <<< "$NIX_ARGS" || true
+
+          workers="$(getconf _NPROCESSORS_ONLN)"
+          eval_args=(--workers "$workers")
+          if [ -r /proc/meminfo ]; then
+            mem_mib="$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)"
+            eval_args+=(--max-memory-size "$(( mem_mib * 3 / 4 / workers ))")
+          fi
+
+          prefilter="$FILTER"
+          if grep -q name <<< "$FILTER"; then
+            prefilter=true
+          fi
+
+          if ! "$NIX_EVAL_JOBS" "${eval_args[@]}" "${nix_args[@]}" \
+              --flake "$FLAKE" \
+              --select '
+                flake:
+                let
+                  recurse = attrs: attrs // { recurseForDerivations = true; };
+                  stub = derivation { name = "stub"; system = "stub"; builder = "stub"; };
+                  stubs = systems: recurse (builtins.mapAttrs (_: attrs: recurse (builtins.mapAttrs (_: _: stub) attrs)) systems);
+                in
+                recurse {
+                  checks = stubs (flake.outputs.checks or { });
+                  packages = stubs (flake.outputs.packages or { });
+                }
+              ' |
+            jq -c '
+              {
+                top_attr: .attrPath[0],
+                system: (.attrPath[1] // ""),
+                attr: (.attrPath[2:] | join(".")),
+                name: "",
+                description: "",
+                error
+              }
+              | select(
+                '"$prefilter"'
+              )
+            ' > "$work/listed.jsonl"; then
+            echo "::error::Flake evaluation failed"
+            echo "success=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          jq -s 'map(select(.error == null)) | reduce .[] as $j ({}; .[$j.top_attr][$j.system] += [$j.attr])' \
+            "$work/listed.jsonl" > "$work/selected.json"
+
       - name: Evaluate and build
         id: build
         env:
@@ -333,15 +409,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-
-          if [ "$MAX_PARALLEL" -lt 1 ]; then
-            echo "::error::max_parallel_builds must be at least 1"
-            exit 1
-          fi
-
           work="$RUNNER_TEMP/nixbuild-ci"
-          rm -rf "$work"
-          mkdir -p "$work/results" "$work/logs"
 
           nix_args=()
           read -r -d '' -a nix_args <<< "$NIX_ARGS" || true
@@ -353,21 +421,31 @@ jobs:
             eval_args+=(--max-memory-size "$(( mem_mib * 3 / 4 / workers ))")
           fi
 
+          selection="$(jq -j 'tojson | tojson | gsub("[\u0024]"; "\\\u0024")' "$work/selected.json")"
+
           evaluate() {
             "$NIX_EVAL_JOBS" "${eval_args[@]}" "${nix_args[@]}" \
               --flake "$FLAKE" \
               --select '
                 flake:
                 let
+                  selected = builtins.fromJSON '"$selection"';
                   recurse = attrs: attrs // { recurseForDerivations = true; };
-                  systems = outputs: recurse (builtins.mapAttrs (_: recurse) outputs);
+                  notDerivation = derivation { name = "stub"; system = "stub"; builder = "stub"; } // { ciNotDerivation = true; };
+                  orStub = value: if (value.type or null) == "derivation" then value else notDerivation;
+                  pick = top: system: attrs:
+                    let outputs = builtins.getAttr system (builtins.getAttr top flake.outputs);
+                    in recurse (builtins.listToAttrs (map (attr: {
+                      name = attr;
+                      value = orStub (builtins.getAttr attr outputs);
+                    }) attrs));
                 in
-                recurse {
-                  checks = systems (flake.outputs.checks or { });
-                  packages = systems (flake.outputs.packages or { });
-                }
+                recurse (builtins.mapAttrs (top: systems: recurse (builtins.mapAttrs (pick top) systems)) selected)
               ' \
-              --apply 'drv: { description = (builtins.tryEval (drv.meta.description or "")).value; }' |
+              --apply 'drv: {
+                description = (builtins.tryEval (drv.meta.description or "")).value;
+                derivation = !(drv.ciNotDerivation or false);
+              }' |
             jq -c --unbuffered '
               {
                 top_attr: .attrPath[0],
@@ -377,15 +455,26 @@ jobs:
                 description: (.extraValue.description // ""),
                 drvPath,
                 outputs,
+                derivation: (.extraValue.derivation != false),
                 error
               }
               | select(
                 '"$FILTER"'
               )
-              | . + {label: (
-                '"$LABEL"'
-              )}
             '
+          }
+
+          builds() {
+            {
+              jq -c 'select(.error) | select(
+                '"$FILTER"'
+              )' "$work/listed.jsonl"
+              if [ "$selection" != '"{}"' ]; then
+                evaluate
+              fi
+            } | jq -c --unbuffered '. + {label: (
+              '"$LABEL"'
+            )}'
           }
 
           print_log() {
@@ -434,7 +523,7 @@ jobs:
             stop_on_failure=true
           fi
 
-          exec {evaluation}< <(evaluate)
+          exec {evaluation}< <(builds)
           evaluation_pid=$!
 
           n=0
@@ -443,6 +532,10 @@ jobs:
             if "$stop_on_failure" && [ -e "$work/failed" ]; then
               stopped=true
               break
+            fi
+            if jq -e '.derivation == false' <<< "$job" > /dev/null; then
+              jq -r '"::warning::\(.top_attr).\(.system).\(.attr) is not a derivation"' <<< "$job"
+              continue
             fi
             while [ "$(jobs -rp | wc -l)" -ge "$MAX_PARALLEL" ]; do
               wait -n || true
