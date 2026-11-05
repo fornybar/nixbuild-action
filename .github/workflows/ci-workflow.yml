@@ -266,9 +266,11 @@ jobs:
             ${{inputs.nix_conf}}
           nix_version: ${{inputs.nix_version}}
       - name: Configure .netrc for GitHub token
+        env:
+          GITHUB_ACCESS_TOKEN: ${{ secrets.github_access_token }}
         run: |
-          if [ -n '${{secrets.github_access_token}}' ]; then
-            printf 'machine github.com\nlogin github-token\npassword %s\n' '${{secrets.github_access_token}}' >> "$HOME/.netrc"
+          if [ -n "$GITHUB_ACCESS_TOKEN" ]; then
+            printf 'machine github.com\nlogin github-token\npassword %s\n' "$GITHUB_ACCESS_TOKEN" >> "$HOME/.netrc"
             chmod 600 "$HOME/.netrc"
           fi
       - name: Pre-evaluation script
@@ -330,9 +332,11 @@ jobs:
           settings: ${{inputs.settings}}
           tags: ${{inputs.tags}}
       - name: Configure .netrc for GitHub token
+        env:
+          GITHUB_ACCESS_TOKEN: ${{ secrets.github_access_token }}
         run: |
-          if [ -n '${{secrets.github_access_token}}' ]; then
-            printf 'machine github.com\nlogin github-token\npassword %s\n' '${{secrets.github_access_token}}' >> "$HOME/.netrc"
+          if [ -n "$GITHUB_ACCESS_TOKEN" ]; then
+            printf 'machine github.com\nlogin github-token\npassword %s\n' "$GITHUB_ACCESS_TOKEN" >> "$HOME/.netrc"
             chmod 600 "$HOME/.netrc"
           fi
 
